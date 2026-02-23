@@ -1,0 +1,355 @@
+一、课题与功能概述
+
+本设计题目为：基于单片机的压力报警器系统设计。系统以 STM32F103 为控制核心，结合 HX711 压力传感器模块、按键、蜂鸣器和 LED 指示灯，实现如下功能：
+
+通过压力传感器采集压力值；
+
+对压力值进行阈值设定；
+
+压力超过阈值时，进行声光报警，并在 OLED 上实时显示压力值；
+
+可以通过按键消除当前报警，当压力恢复到安全范围后允许下一次报警。
+
+二、系统总体结构
+2.1 硬件结构概述（简写）
+
+主控芯片：STM32F103C8T6；
+
+压力传感器：电阻应变片 + HX711 放大/AD 转换模块；
+
+显示模块：I²C 接口 OLED；
+
+声光报警：PB0 接有源蜂鸣器（通过 TIM3 PWM 驱动），PC13 板载 LED；
+
+按键输入：PA15~PA12 独立按键，其中 PA15 用作“消音/消警”键。
+
+2.2 软件结构
+
+工程主要文件及作用：
+
+main.c：程序入口，只调用 SysInit()、SysFunc() 和 SysLoop() 三个系统函数。
+
+main
+
+system.c / system.h：系统初始化与主循环逻辑；包含 HX711 初始化、OLED 显示以及超载报警任务等。
+
+system
+
+HX711.c / HX711.h：压力传感器 HX711 的底层驱动、平均滤波、去皮、标定和称重接口。
+
+HX711
+
+Buzzer.c / Buzzer.h：蜂鸣器 PWM 驱动以及 PC13 指示灯初始化与闪烁控制。
+
+Buzzer
+
+ 
+
+Buzzer
+
+Key.c / Key.h：独立按键和矩阵键盘的初始化与扫描，本系统中主要使用独立按键 KEY1(PA15) 实现报警消音。
+
+Key
+
+三、关键模块代码分析
+3.1 主程序与系统初始化
+
+main.c 中的入口函数非常简洁：
+
+int main(void)
+{
+    SysInit();
+    SysFunc();
+    SysLoop();
+}
+
+
+系统上电后依次完成：
+
+SysInit()：
+
+配置中断优先级分组；
+
+初始化 HX711 接口、SysTick 定时、OLED、蜂鸣器和按键；
+
+初始化 PC13 LED；
+
+设置 HX711 的标定参数（零点、比例系数）；
+
+OLED 显示基础界面。
+
+system
+
+SysFunc()：预留系统功能扩展，目前为空函数。
+
+system
+
+SysLoop()：系统主循环，负责周期性称重、显示以及报警处理，是整个应用逻辑的核心。
+
+system
+
+SysInit 关键配置说明
+void SysInit(void)
+{
+    NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
+
+    HX711_GPIO_Init();
+    SysTick_Init(72);
+    OLED_Init();
+    Buzzer_Init();
+    KEY_Init();
+    PC13LED_Init();
+    Buzzer_N_Beep(2);
+    Delay_ms(200);
+
+    HX711_SetCalibration(-11140, 673.47f);
+    PC13_LED_Blink(3);
+
+    OLED_Clear();
+    OLED_ShowString_RC(2, 1, (u8 *)"W:      g");
+    OLED_Refresh_Gram();
+}
+
+
+配置 NVIC 分组，便于后续扩展中断；
+
+初始化各外设后，通过蜂鸣器响两次、LED 闪烁三次作为自检提示；
+
+调用 HX711_SetCalibration() 设置事先标定好的零点和比例系数，使系统上电后直接可用，无需现场再次标定；
+
+system
+
+设置好 OLED 第2行的固定格式 "W: g"，中间留出空白区域用于后续刷新当前重量数值。
+
+system
+
+3.2 HX711 称重与标定
+
+HX711 驱动部分实现了从底层位操作到高层重量计算的完整流程。
+
+3.2.1 原始数据读取
+
+Read_HX711() 函数通过 24 个时钟上升沿依次读取 DATA 引脚，形成 24 位的原始数据，并进行补码符号扩展：
+
+HX711
+
+先等待 DATA 变低表示转换完成；
+
+每个时钟周期左移一位并根据 DATA 电平置位最低位；
+
+根据最高位判断正负并进行 32 位补码扩展。
+
+3.2.2 多次平均与标定
+
+HX711_ReadAverage() 用指定次数采样求平均，减小瞬时噪声；HX711_Tare() 和 HX711_Calibrate() 通过“空载”和“已知砝码重量”计算零点 hx_offset 与比例 hx_scale：
+
+HX711
+
+最终，HX711_GetWeight() 将当前平均值减去零点，利用比例换算成单位为克的重量值：
+
+float HX711_GetWeight(uint16_t times)
+{
+    int32_t raw = HX711_ReadAverage(times);
+    int32_t net = raw - hx_offset;
+
+    if (hx_scale == 0.0f)
+        hx_scale = 1.0f;
+
+    return (float)net / hx_scale;
+}
+
+
+HX711
+
+在系统初始化阶段，调用 HX711_SetCalibration(-11140, 673.47f); 直接写入先验标定结果，简化用户操作。
+
+HX711
+
+3.3 主循环：压力显示与滤波
+
+SysLoop() 中的主循环核心代码如下：
+
+system
+
+while (1)
+{
+    float w_raw;
+    static float w_filtered = 0;
+    static uint8_t filter_inited = 0;
+    char num_buf[10];
+
+    w_raw = HX711_GetWeight(10);
+
+    // 一阶 IIR 低通滤波
+    if (!filter_inited)
+    {
+        w_filtered   = w_raw;
+        filter_inited = 1;
+    }
+    else
+    {
+        w_filtered = FILTER_ALPHA * w_raw +
+                    (1.0f - FILTER_ALPHA) * w_filtered;
+    }
+
+    sprintf(num_buf, "%6.1f", w_filtered);
+
+    OLED_ShowString_RC(2, 3, (u8 *)num_buf);
+    OLED_Refresh_Gram();
+
+    Overload_AlarmTask(w_filtered);
+
+    Delay_ms(200);
+}
+
+
+每 200ms 读取一次重量，采用 一阶 IIR 低通滤波（FILTER_ALPHA=0.5），在响应速度与稳定性之间折衷；
+
+通过 sprintf 统一格式为 6 位宽、1 位小数（如 "123.4"），保证每次能覆盖旧值；
+
+调用 OLED_ShowString_RC 仅刷新数字区域，提高效率；
+
+调用 Overload_AlarmTask() 完成超载检测和报警处理。
+
+3.4 超载报警与消音逻辑
+
+报警逻辑封装在 Overload_AlarmTask(float weight) 中：
+
+system
+
+#define OVERLOAD_THRESHOLD   340.0f   // 超载阈值 340g
+#define OVERLOAD_RESET       330.0f   // 解除超载回差 330g
+#define FILTER_ALPHA         0.5f
+static uint8_t g_overload_muted = 0;
+
+
+OVERLOAD_THRESHOLD 为超载报警阈值 340g；
+
+OVERLOAD_RESET 为解除报警的回差值 330g，避免重量在边缘抖动时频繁报警；
+
+g_overload_muted 用于记录本次超载是否已经被“消音”。
+
+函数内部逻辑分三步：
+
+按键检测与消音
+
+u8 key = KEY_Scan(0);
+if (key == KEY1_PRESS)
+{
+    g_overload_muted = 1;
+    Buzzer_Off();
+    PC13_LED_OFF();
+}
+
+
+使用 KEY_Scan(0) 以“单次触发模式”扫描独立按键，当检测到 KEY1(PA15) 按下时，将 g_overload_muted 置 1 并立即关闭蜂鸣器和 LED。
+
+Key
+
+超载判断与声光报警
+
+if (weight > OVERLOAD_THRESHOLD)
+{
+    if (!g_overload_muted)
+    {
+        Buzzer_Beep(100);
+        PC13_LED_TOGGLE();
+    }
+    else
+    {
+        Buzzer_Off();
+        PC13_LED_OFF();
+    }
+}
+
+
+当重量超过阈值且“未被消音”时，蜂鸣器响 100ms，LED 每次调用翻转，实现闪烁效果；若已经按键消音，则完全关闭声光输出。
+
+恢复区间与下一次报警
+
+else
+{
+    Buzzer_Off();
+    PC13_LED_OFF();
+
+    if (weight < OVERLOAD_RESET)
+    {
+        g_overload_muted = 0;
+    }
+}
+
+
+当重量低于报警阈值时，系统关闭报警；只有当重量进一步低于 OVERLOAD_RESET（例如完全卸载砝码）时，才清除 g_overload_muted，允许下次超载再次报警，从而形成一个带回差的单次报警机制，避免在阈值附近频繁响停。
+
+3.5 蜂鸣器与 LED 驱动
+
+Buzzer_Init() 使用 TIM3 CH3 对 PB0 产生 PWM 驱动有源蜂鸣器：
+
+Buzzer
+
+预分频 72 分频后得到 1MHz 计数时钟；
+
+周期设为 1000，对应 1kHz 方波；
+
+通过修改 CCR3 控制占空比，Buzzer_On() 设置非零占空比，Buzzer_Off() 将 CCR3 置 0 关闭蜂鸣器。
+
+Buzzer
+
+PC13 LED 通过普通 GPIO 推挽输出实现，提供亮灭与闪烁函数：
+
+Buzzer
+
+ 
+
+Buzzer
+
+四、与课题要求的对应关系
+
+压力传感器测定压力值
+
+HX711 完整驱动与标定，HX711_GetWeight() 返回单位为克的重量值；
+
+主循环中持续调用并显示在 OLED 上。✅
+
+对于压力值进行阈值设定
+
+代码中定义 OVERLOAD_THRESHOLD = 340.0f 与 OVERLOAD_RESET = 330.0f 作为超载阈值和回差值，实现固定阈值报警策略。✅
+
+超过阈值实现声光报警，显示压力值
+
+若重量大于 340g 且未被消音，蜂鸣器周期响、LED 闪烁；
+
+OLED 始终显示当前实时重量。✅
+
+可以通过按键取消报警
+
+PA15 对应 KEY1 按下后，g_overload_muted 置位并关闭蜂鸣器与 LED，本次超载期间不会再报警；
+
+重量恢复到安全区（<330g）后才允许下次报警。✅
+
+综合来看，程序完全满足题目给出的四项设计要求。
+
+五、系统优点与改进建议
+5.1 已实现的优点
+
+结构清晰：初始化、主循环、传感器驱动、按键与报警分别封装在不同文件，便于维护与扩展；
+
+抗抖与滤波：按键加入消抖延时；重量测量采用平均 + IIR 滤波，结果稳定；
+
+带回差的报警逻辑：避免阈值附近抖动引起的反复报警；
+
+代码注释较完整：关键部分有注释，便于阅读与讲解。
+
+5.2 可进一步改进的方向（
+
+可调阈值：
+通过矩阵键盘或独立按键在运行时设置报警阈值，并存入 Flash/Eeprom，下次上电自动恢复。
+
+零点自动去皮：
+增加“去皮按键”，按下后调用 HX711_Tare()，适应不同放置环境。
+
+单位与显示界面优化：
+可在 OLED 上增加“当前阈值”“状态（正常/报警/静音）”等信息，使人机交互更加友好。
+
+多级报警：
+不同压力区间使用不同的蜂鸣器节奏或 LED 闪烁频率，实现分级预警。
